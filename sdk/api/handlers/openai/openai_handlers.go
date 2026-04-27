@@ -8,9 +8,12 @@ package openai
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
@@ -18,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	responsesconverter "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/openai/openai/responses"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -681,4 +685,175 @@ func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flush
 			_, _ = fmt.Fprint(c.Writer, "data: [DONE]\n\n")
 		},
 	})
+}
+
+// Embeddings handles the /v1/embeddings endpoint.
+// For models with a dedicated codex upstream (e.g., Azure deployments),
+// the request is forwarded directly to the /embeddings endpoint.
+// Otherwise it falls back to the standard executor path.
+func (h *OpenAIAPIHandler) Embeddings(c *gin.Context) {
+	rawJSON, err := c.GetRawData()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("Invalid request: %v", err),
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+	if !json.Valid(rawJSON) {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: "Invalid request: body must be valid JSON",
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+
+	modelName := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
+	if modelName == "" {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: "Invalid request: model is required",
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+
+	providers := util.GetProviderName(modelName)
+	hasCodexProvider := false
+	for _, p := range providers {
+		if strings.EqualFold(p, "codex") {
+			hasCodexProvider = true
+			break
+		}
+	}
+	if hasCodexProvider && h.AuthManager.HasAuthWithBaseURL("codex") {
+		h.executeDirectEmbedding(c, rawJSON, modelName)
+		return
+	}
+
+	cliCtx, cliCancel := h.GetContextWithCancel(h, c, c.Request.Context())
+	out, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, "openai", modelName, rawJSON, "embeddings")
+	cliCancel()
+
+	if errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		return
+	}
+
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	c.Header("Content-Type", "application/json")
+	_, _ = c.Writer.Write(out)
+}
+
+// executeDirectEmbedding forwards embedding requests directly to the upstream
+// /embeddings endpoint, bypassing the chat completions path.
+func (h *OpenAIAPIHandler) executeDirectEmbedding(c *gin.Context, body []byte, modelName string) {
+	cliCtx, cliCancel := h.GetContextWithCancel(h, c, c.Request.Context())
+
+	out, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, "codex", modelName, body, "embeddings")
+	cliCancel()
+
+	if errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		return
+	}
+
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	c.Header("Content-Type", "application/json")
+	_, _ = c.Writer.Write(out)
+}
+
+// AudioTranscriptions handles the /v1/audio/transcriptions endpoint.
+// It accepts multipart/form-data with an audio file and forwards it to the upstream.
+func (h *OpenAIAPIHandler) AudioTranscriptions(c *gin.Context) {
+	// Parse multipart form (max 256MB for large audio files)
+	if err := c.Request.ParseMultipartForm(256 << 20); err != nil {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("Invalid request: %v", err),
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+
+	model := strings.TrimSpace(c.PostForm("model"))
+	if model == "" {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: "Invalid request: model is required",
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("Invalid request: file is required: %v", err),
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+	defer func() { _ = file.Close() }()
+
+	fileData, err := io.ReadAll(file)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("Invalid request: failed to read file: %v", err),
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+
+	// Encode file as base64 and build JSON body for executor pipeline.
+	// The executor reconstructs the multipart request from these fields.
+	encoded := make([]byte, base64.StdEncoding.EncodedLen(len(fileData)))
+	base64.StdEncoding.Encode(encoded, fileData)
+
+	body := []byte(`{}`)
+	body, _ = sjson.SetBytes(body, "model", model)
+	body, _ = sjson.SetBytes(body, "file_data", string(encoded))
+	body, _ = sjson.SetBytes(body, "file_name", header.Filename)
+
+	// Copy over optional form fields
+	for _, field := range []string{"language", "prompt", "response_format", "temperature"} {
+		if v := strings.TrimSpace(c.PostForm(field)); v != "" {
+			body, _ = sjson.SetBytes(body, field, v)
+		}
+	}
+
+	cliCtx, cliCancel := h.GetContextWithCancel(h, c, c.Request.Context())
+	out, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, "codex", model, body, "audio/transcriptions")
+	cliCancel()
+
+	if errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		return
+	}
+
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+
+	// Set content type based on response_format if not already set
+	if c.Writer.Header().Get("Content-Type") == "" {
+		rf := strings.TrimSpace(c.PostForm("response_format"))
+		switch strings.ToLower(rf) {
+		case "text", "srt", "vtt":
+			c.Header("Content-Type", "text/plain")
+		default:
+			c.Header("Content-Type", "application/json")
+		}
+	}
+
+	_, _ = c.Writer.Write(out)
 }
